@@ -1,0 +1,12 @@
+torch>=2.0.0
+transformers>=4.36.0
+datasets
+peft>=0.7.0
+accelerate>=0.25.0
+Pillow
+nltk
+rouge-score
+sentencepiece
+protobuf
+einops
+numpy
