@@ -159,7 +159,7 @@ medical-image-captioning/
 - [Google ViT-Base](https://huggingface.co/google/vit-base-patch16-224) — Vision Transformer
 - [LoRA (Hu et al., 2022)](https://arxiv.org/abs/2106.09685) — Low-Rank Adaptation
 - [LLaVA (Liu et al., 2023)](https://arxiv.org/abs/2304.08485) — Projection design inspiration
-- [PFMVG (He et al., 2025)](https://doi.org/10.1109/ISBI56570.2024.10635742) — Comparative reference for medical MLLM approaches
+  
 
 ---
 
