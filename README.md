@@ -13,7 +13,7 @@ A parameter-efficient multimodal system for generating natural language descript
 
 ## Architecture
 
-![Architecture and data flow diagram](docs/architecture.png)
+
 
 The ViT-Base encoder stays frozen and emits 197 patch embeddings. A two-layer projection MLP lifts them to the Phi-2 embedding width and they're concatenated ahead of the tokenized prompt and caption. LoRA adapters sit on the query and value projections of the decoder; every other decoder weight stays frozen. Cross-entropy is computed on caption tokens only, with image tokens, the prompt prefix, and padding masked to −100.
 
