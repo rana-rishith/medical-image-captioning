@@ -1,0 +1,478 @@
+"""
+Smoke test / partial run for the ViT-Base + Phi-2 (LoRA) medical image
+captioning pipeline.
+
+Runs the FULL training graph end-to-end (data load -> ViT -> projection ->
+concat -> Phi-2 forward/backward -> optimizer step -> checkpoint save/load
+-> greedy generation w/ 3-gram blocking -> pycocoevalcap scoring) on a tiny
+slice of ROCOv2. Goal: catch setup problems in ~2-5 minutes instead of 3+
+hours into the real run.
+
+Usage (on the RunPod terminal, not a notebook):
+    python3 smoke_test.py --n-train 16 --n-val 4 --steps 5 \
+        --cache-dir /workspace/hf_cache
+
+Exit code 0 = every stage passed. Non-zero = see SMOKE TEST SUMMARY.
+"""
+
+import argparse
+import sys
+import time
+import traceback
+
+import torch
+import torch.nn as nn
+
+CHECKS = {}
+
+
+def mark(name, ok, detail=""):
+    CHECKS[name] = ok
+    tag = "PASS" if ok else "FAIL"
+    print(f"  [{tag}] {name}" + (f" — {detail}" if detail else ""))
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--n-train", type=int, default=16)
+    p.add_argument("--n-val", type=int, default=4)
+    p.add_argument("--steps", type=int, default=5)
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--max-len", type=int, default=256)
+    p.add_argument("--cache-dir", type=str, default="/workspace/hf_cache")
+    p.add_argument("--ckpt-path", type=str, default="/tmp/smoke_ckpt.pt")
+    return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 0 — GPU preflight (Blackwell / sm_120 aware, matches full script)
+# ─────────────────────────────────────────────────────────────────────────
+def preflight_gpu():
+    print("\n=== Stage 0: GPU preflight ===")
+    try:
+        if not torch.cuda.is_available():
+            mark("cuda_available", False, "no GPU visible")
+            return False
+        cap = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name()
+        vram = torch.cuda.get_device_properties(0).total_mem_ / 1e9 if hasattr(
+            torch.cuda.get_device_properties(0), "total_mem_"
+        ) else torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  device={name}  capability=sm_{cap[0]}{cap[1]}  vram={vram:.1f}GB")
+
+        if cap[0] >= 12:
+            arch_list = torch.cuda.get_arch_list()
+            if not any("120" in a or "sm_12" in a for a in arch_list):
+                mark(
+                    "blackwell_arch_support",
+                    False,
+                    f"torch built for {arch_list}, GPU is sm_{cap[0]}{cap[1]} — "
+                    "reinstall with --index-url https://download.pytorch.org/whl/cu128",
+                )
+                return False
+            mark("blackwell_arch_support", True)
+
+        a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        _ = a @ b
+        torch.cuda.synchronize()
+        mark("bf16_matmul", True)
+        mark("cuda_available", True)
+        return True
+    except Exception as e:
+        mark("gpu_preflight", False, str(e))
+        traceback.print_exc()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 1 — Data
+# ─────────────────────────────────────────────────────────────────────────
+def load_data(args):
+    print("\n=== Stage 1: Dataset ===")
+    from datasets import load_dataset
+
+    # cache_dir passed directly to load_dataset — env vars alone are not
+    # reliable on RunPod's default image.
+    ds = load_dataset("eltorio/ROCOv2-radiology", cache_dir=args.cache_dir)
+    split_names = list(ds.keys())
+    print(f"  splits found: {split_names}")
+
+    train = ds["train"].select(range(min(args.n_train, len(ds["train"]))))
+    val_split = "validation" if "validation" in ds else "test"
+    val = ds[val_split].select(range(min(args.n_val, len(ds[val_split]))))
+
+    mark("dataset_load", True, f"{len(train)} train / {len(val)} val samples pulled")
+    return train, val
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 2 — Models
+# ─────────────────────────────────────────────────────────────────────────
+class Projection(nn.Module):
+    """768 -> 2560 -> 2560, LLaVA-style. Second layer zero-inits so image
+    tokens contribute no signal at step 0. No LayerNorm (produces NaN under
+    mixed precision per the paper's methodology)."""
+
+    def __init__(self, in_dim=768, hidden=2560, out_dim=2560):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, out_dim)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+
+def load_models(device):
+    print("\n=== Stage 2: Model loading ===")
+    from transformers import ViTImageProcessor, ViTModel, AutoTokenizer, AutoModelForCausalLM
+    from peft import LoraConfig, get_peft_model
+
+    dtype = torch.bfloat16
+
+    vit_proc = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+    vit = (
+        ViTModel.from_pretrained("google/vit-base-patch16-224", torch_dtype=dtype)
+        .to(device)
+        .eval()
+    )
+    for p in vit.parameters():
+        p.requires_grad = False
+    mark("vit_load", True, f"{sum(p.numel() for p in vit.parameters())/1e6:.1f}M params, frozen")
+
+    tok = AutoTokenizer.from_pretrained("microsoft/phi-2")
+    tok.pad_token = tok.eos_token
+
+    phi2 = AutoModelForCausalLM.from_pretrained(
+        "microsoft/phi-2", torch_dtype=dtype, attn_implementation="sdpa"
+    ).to(device)
+
+    lora_cfg = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj"],
+        task_type="CAUSAL_LM",
+    )
+    phi2 = get_peft_model(phi2, lora_cfg)
+    # Promote adapters to fp32 to prevent gradient underflow, per methodology.
+    n_lora = 0
+    for n, p in phi2.named_parameters():
+        if "lora_" in n:
+            p.data = p.data.float()
+            n_lora += p.numel()
+    phi2.gradient_checkpointing_enable()
+    mark("phi2_lora_load", True, f"{n_lora/1e6:.2f}M trainable LoRA params")
+
+    proj = Projection().to(device).float()
+    mark("projection_init", True, f"{sum(p.numel() for p in proj.parameters())/1e6:.2f}M params")
+
+    return vit_proc, vit, tok, phi2, proj
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 3 — Batch construction (image embed + prompt + caption, -100 mask)
+# ─────────────────────────────────────────────────────────────────────────
+def build_batch(samples, vit_proc, vit, tok, phi2, proj, device, max_len):
+    dtype = torch.bfloat16
+    images = [s["image"].convert("RGB") for s in samples]
+    captions = [s["caption"] for s in samples]
+
+    pv = vit_proc(images=images, return_tensors="pt")["pixel_values"].to(device, dtype)
+    with torch.no_grad():
+        vit_out = vit(pixel_values=pv).last_hidden_state  # [B, 197, 768]
+    img_embeds = proj(vit_out.float()).to(dtype)  # [B, 197, 2560]
+    B, n_img, _ = img_embeds.shape
+
+    prompt_text = "Caption this medical image: "
+    prompt_ids = tok(prompt_text, add_special_tokens=False).input_ids
+
+    ids_list, labels_list = [], []
+    for cap in captions:
+        cap_ids = tok(cap, add_special_tokens=False).input_ids + [tok.eos_token_id]
+        ids = (prompt_ids + cap_ids)[:max_len]
+        labs = ([-100] * len(prompt_ids) + cap_ids)[:max_len]
+        ids_list.append(ids)
+        labels_list.append(labs)
+
+    max_txt = max(len(x) for x in ids_list)
+    pad_id = tok.eos_token_id
+    padded_ids, padded_labels, txt_attn = [], [], []
+    for ids, labs in zip(ids_list, labels_list):
+        pad_n = max_txt - len(ids)
+        padded_ids.append(ids + [pad_id] * pad_n)
+        padded_labels.append(labs + [-100] * pad_n)
+        txt_attn.append([1] * len(ids) + [0] * pad_n)
+
+    input_ids = torch.tensor(padded_ids, device=device)
+    txt_labels = torch.tensor(padded_labels, device=device)
+    txt_attn = torch.tensor(txt_attn, device=device)
+
+    embed_fn = phi2.get_input_embeddings()
+    text_embeds = embed_fn(input_ids).to(dtype)
+
+    img_attn = torch.ones(B, n_img, device=device, dtype=txt_attn.dtype)
+    img_labels = torch.full((B, n_img), -100, device=device, dtype=txt_labels.dtype)
+
+    inputs_embeds = torch.cat([img_embeds, text_embeds], dim=1)
+    attn_mask = torch.cat([img_attn, txt_attn], dim=1)
+    labels = torch.cat([img_labels, txt_labels], dim=1)
+
+    return inputs_embeds, attn_mask, labels
+
+
+def compute_loss(logits, labels):
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+    return loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 4 — A handful of real optimizer steps
+# ─────────────────────────────────────────────────────────────────────────
+def run_train_steps(args, device, vit_proc, vit, tok, phi2, proj, train):
+    print("\n=== Stage 3-4: Batch construction + optimizer steps ===")
+    try:
+        trainable = [p for p in proj.parameters()] + [
+            p for n, p in phi2.named_parameters() if p.requires_grad
+        ]
+        optim = torch.optim.AdamW(
+            [
+                {"params": proj.parameters(), "lr": 2e-3},
+                {"params": [p for n, p in phi2.named_parameters() if p.requires_grad], "lr": 2e-4},
+            ],
+            weight_decay=0.01,
+        )
+
+        n = len(train)
+        bs = min(args.batch_size, n)
+        for step in range(args.steps):
+            idx = [i % n for i in range(step * bs, step * bs + bs)]
+            samples = [train[i] for i in idx]
+
+            inputs_embeds, attn_mask, labels = build_batch(
+                samples, vit_proc, vit, tok, phi2, proj, device, args.max_len
+            )
+            out = phi2(inputs_embeds=inputs_embeds, attention_mask=attn_mask)
+            loss = compute_loss(out.logits, labels)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                mark("train_steps", False, f"non-finite loss at step {step}: {loss.item()}")
+                return False
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optim.step()
+            optim.zero_grad()
+
+            mem = torch.cuda.memory_allocated() / 1e9
+            print(f"  step {step}: loss={loss.item():.4f}  gpu_mem={mem:.2f}GB")
+
+        mark("train_steps", True, f"{args.steps} steps, all finite")
+        return True
+    except Exception as e:
+        mark("train_steps", False, str(e))
+        traceback.print_exc()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 5 — Checkpoint save/reload
+# ─────────────────────────────────────────────────────────────────────────
+def checkpoint_roundtrip(args, phi2, proj):
+    print("\n=== Stage 5: Checkpoint save/reload ===")
+    try:
+        lora_state = {n: p.detach().cpu() for n, p in phi2.named_parameters() if p.requires_grad}
+        torch.save({"proj": proj.state_dict(), "lora": lora_state}, args.ckpt_path)
+
+        ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+        proj.load_state_dict(ckpt["proj"])
+        state_dict = dict(phi2.state_dict())
+        for k, v in ckpt["lora"].items():
+            state_dict[k] = v
+        phi2.load_state_dict(state_dict, strict=False)
+
+        mark("checkpoint_roundtrip", True, args.ckpt_path)
+        return True
+    except Exception as e:
+        mark("checkpoint_roundtrip", False, str(e))
+        traceback.print_exc()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 6 — Greedy generation with 3-gram repetition blocking
+# ─────────────────────────────────────────────────────────────────────────
+def generate_no_repeat_3gram(phi2, tok, inputs_embeds, attn_mask, max_new_tokens=40):
+    device = inputs_embeds.device
+    generated_ids = []
+    past = None
+    cur_embeds = inputs_embeds
+    cur_attn = attn_mask
+
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            out = phi2(
+                inputs_embeds=cur_embeds,
+                attention_mask=cur_attn,
+                past_key_values=past,
+                use_cache=True,
+            )
+        logits = out.logits[:, -1, :].float()
+        past = out.past_key_values
+
+        if len(generated_ids) >= 2:
+            for i in range(len(generated_ids) - 1):
+                if generated_ids[i] == generated_ids[-1] if False else False:
+                    pass
+            seen_ngrams = {
+                tuple(generated_ids[i : i + 3]) for i in range(len(generated_ids) - 2)
+            }
+            if len(generated_ids) >= 2:
+                prefix = tuple(generated_ids[-2:])
+                for ng in seen_ngrams:
+                    if ng[:2] == prefix:
+                        logits[0, ng[2]] = float("-inf")
+
+        next_id = torch.argmax(logits, dim=-1).item()
+        if next_id == tok.eos_token_id:
+            break
+        generated_ids.append(next_id)
+
+        next_embed = phi2.get_input_embeddings()(
+            torch.tensor([[next_id]], device=device)
+        ).to(cur_embeds.dtype)
+        cur_embeds = next_embed
+        cur_attn = torch.cat([cur_attn, torch.ones(1, 1, device=device, dtype=cur_attn.dtype)], dim=1)
+
+    return tok.decode(generated_ids, skip_special_tokens=True)
+
+
+def run_generation_check(args, device, vit_proc, vit, tok, phi2, proj, val):
+    print("\n=== Stage 6: Greedy generation (3-gram blocked) ===")
+    try:
+        phi2.eval()
+        sample = val[0]
+        image = sample["image"].convert("RGB")
+        ref_caption = sample["caption"]
+
+        pv = vit_proc(images=[image], return_tensors="pt")["pixel_values"].to(device, torch.bfloat16)
+        with torch.no_grad():
+            vit_out = vit(pixel_values=pv).last_hidden_state
+        img_embeds = proj(vit_out.float()).to(torch.bfloat16)
+
+        prompt_ids = tok("Caption this medical image: ", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        prompt_embeds = phi2.get_input_embeddings()(prompt_ids).to(torch.bfloat16)
+
+        inputs_embeds = torch.cat([img_embeds, prompt_embeds], dim=1)
+        attn_mask = torch.ones(inputs_embeds.shape[:2], device=device)
+
+        gen_caption = generate_no_repeat_3gram(phi2, tok, inputs_embeds, attn_mask)
+        phi2.train()
+
+        print(f"  REF: {ref_caption}")
+        print(f"  GEN: {gen_caption}")
+        mark("generation", True)
+        return ref_caption, gen_caption
+    except Exception as e:
+        mark("generation", False, str(e))
+        traceback.print_exc()
+        return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Stage 7 — pycocoevalcap plumbing check
+# ─────────────────────────────────────────────────────────────────────────
+def run_metric_check(ref_caption, gen_caption):
+    print("\n=== Stage 7: pycocoevalcap plumbing ===")
+    if ref_caption is None or gen_caption is None:
+        mark("pycocoevalcap", False, "skipped — no caption from generation stage")
+        return
+    try:
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+
+        gts = {"0": [{"caption": ref_caption}]}
+        res = {"0": [{"caption": gen_caption if gen_caption.strip() else "no finding"}]}
+
+        tokenizer = PTBTokenizer()
+        gts_tok = tokenizer.tokenize(gts)
+        res_tok = tokenizer.tokenize(res)
+
+        scores = {}
+        bleu_score, _ = Bleu(4).compute_score(gts_tok, res_tok)
+        scores["BLEU-1..4"] = [round(s, 4) for s in bleu_score]
+        scores["METEOR"] = round(Meteor().compute_score(gts_tok, res_tok)[0], 4)
+        scores["ROUGE-L"] = round(Rouge().compute_score(gts_tok, res_tok)[0], 4)
+        scores["CIDEr"] = round(Cider().compute_score(gts_tok, res_tok)[0], 4)
+
+        print(f"  1-sample scores (not meaningful, just checking the pipeline runs): {scores}")
+        mark("pycocoevalcap", True, "Bleu/Meteor/Rouge/Cider all returned scores")
+    except Exception as e:
+        mark("pycocoevalcap", False, str(e))
+        traceback.print_exc()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+def report():
+    print("\n" + "=" * 60)
+    print("SMOKE TEST SUMMARY")
+    print("=" * 60)
+    all_ok = True
+    for name, ok in CHECKS.items():
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+        all_ok = all_ok and ok
+    print("=" * 60)
+    if all_ok:
+        print("All stages passed — safe to launch the full run.")
+    else:
+        print("At least one stage failed — do not launch the full run yet.")
+    sys.exit(0 if all_ok else 1)
+
+
+def main():
+    args = parse_args()
+    t0 = time.time()
+
+    if not preflight_gpu():
+        report()
+        return
+
+    device = torch.device("cuda")
+
+    try:
+        train, val = load_data(args)
+    except Exception as e:
+        mark("dataset_load", False, str(e))
+        traceback.print_exc()
+        report()
+        return
+
+    try:
+        vit_proc, vit, tok, phi2, proj = load_models(device)
+    except Exception as e:
+        mark("model_load", False, str(e))
+        traceback.print_exc()
+        report()
+        return
+
+    run_train_steps(args, device, vit_proc, vit, tok, phi2, proj, train)
+    checkpoint_roundtrip(args, phi2, proj)
+    ref_caption, gen_caption = run_generation_check(args, device, vit_proc, vit, tok, phi2, proj, val)
+    run_metric_check(ref_caption, gen_caption)
+
+    print(f"\nTotal wall time: {time.time() - t0:.1f}s (this is NOT a throughput estimate)")
+    report()
+
+
+if __name__ == "__main__":
+    main()
