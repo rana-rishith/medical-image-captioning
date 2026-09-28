@@ -63,3 +63,27 @@ The v4 collapse traced back to cached feature rows that did not match their capt
 
 ---
 
+## Results
+
+All numbers below come from `pycocoevalcap` on the **full official ROCOv2 test split (9,927 images)**. Validation (9,903 images, 1,000-image subset per epoch) was used only to pick the checkpoint.
+
+| | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | ROUGE-L | CIDEr |
+|---|---|---|---|---|---|---|---|
+| **v5 (with image)** | 0.1043 | 0.0561 | 0.0288 | 0.0164 | 0.0579 | 0.1667 | **0.1180** |
+| Blind ablation (features zeroed) | 0.1276 | 0.0628 | 0.0257 | 0.0126 | 0.0423 | 0.1408 | 0.0511 |
+
+### Is the model looking at the image?
+
+The blind row runs the same checkpoint on the same 9,927 images with every visual feature set to zero. With the image, CIDEr more than doubles (0.0511 → 0.1180), and METEOR, ROUGE-L, BLEU-3 and BLEU-4 all rise.
+
+BLEU-1 and BLEU-2 go the other way. Without an image, the decoder falls back on the most common radiology phrasing, and single common words score well on BLEU-1. CIDEr down-weights n-grams that appear across many references, so it rewards the image-specific content that the blind model cannot produce. That is why CIDEr is the metric to read here.
+
+The loss-level grounding probe on 256 test images agrees:
+
+| Probe | Gap |
+|---|---|
+| `zeros_gap` (loss with zeroed features − loss with real features) | +0.284 |
+| `mismatch_gap` (loss with another image's features − loss with real features) | +0.120 |
+
+Both are positive, so real images lower the loss, and the *right* image lowers it further than a wrong one. In v4 the zeros gap sat at −1.85.
+
