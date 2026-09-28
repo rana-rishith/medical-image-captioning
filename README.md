@@ -44,3 +44,22 @@ Training runs in two parts.
 | Micro-batch 4 × gradient accumulation 8 | effective batch 32 on a 12 GB card |
 | `expandable_segments` CUDA allocator | less fragmentation near the memory cap |
 
+### Two-stage training
+
+Joint single-stage training collapsed in earlier versions: the decoder learned to lower the loss from caption statistics alone before the projection learned to carry any visual signal, and the gate drifted toward zero. v5 splits the schedule:
+
+- **Stage A (2 epochs).** Projection only, lr 1e-3. Phi-2 fully frozen, no LoRA. The gate starts at 1.0 and stays frozen, so the model cannot learn to mute the image.
+- **Stage B (3 epochs).** LoRA attached (lr 5e-5), projection continues at lr 2e-4, gate becomes trainable. The optimizer and cosine schedule are rebuilt from scratch so Stage A's momentum does not carry into LoRA.
+
+AdamW (β = 0.9, 0.95), weight decay 0.01, 3% warmup, gradient clipping at 1.0, label smoothing 0.05, seed 0.
+
+### Integrity gates
+
+The v4 collapse traced back to cached feature rows that did not match their captions. v5 refuses to train until alignment is proven:
+
+1. The cache and a row-order manifest are written together, atomically, and tagged with a `cache_sig` hash. Any mismatch hard-fails.
+2. 32 random images are re-encoded through the ViT and must match their cached rows at cosine > 0.995, with an explicit off-by-one check.
+3. The projection must overfit 8 images and recover their captions before the real run starts. (It passed: 7/8 captions recovered, loss 3.90 → 0.29, gate rose from 1.00 to 1.14.)
+
+---
+
