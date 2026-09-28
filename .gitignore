@@ -38,3 +38,9 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
+# v5 run outputs and feature cache
+outputs*/
+vit_feats*/
+*.npy
+*.jsonl
