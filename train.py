@@ -1176,3 +1176,129 @@ CKPT_A = os.path.join(cfg.ckpt_dir, "stage_a.pt")
 CKPT_B = os.path.join(cfg.ckpt_dir, "stage_b.pt")
 CKPT_BEST = os.path.join(cfg.ckpt_dir, "best.pt")
 
+# %% [markdown]
+# ## Cell 14 — Evaluation (pycocoevalcap)
+#
+# `pycocoevalcap` is authoritative. NLTK numbers are not numerically comparable
+# and must never share a table with these. Also computes the **blind** ablation
+# (zeroed features) on the identical image subset, so the sighted/blind delta in
+# metric space is an apples-to-apples comparison.
+
+# %%
+try:
+    from pycocoevalcap.bleu.bleu import Bleu
+    from pycocoevalcap.meteor.meteor import Meteor
+    from pycocoevalcap.rouge.rouge import Rouge
+    from pycocoevalcap.cider.cider import Cider
+    from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+    PYCOCO = True
+except Exception as e:
+    PYCOCO = False
+    print(f"pycocoevalcap unavailable ({e}) — metrics will be skipped")
+
+
+def coco_metrics(refs: List[str], hyps: List[str]) -> Dict[str, float]:
+    if not PYCOCO:
+        return {}
+    gts = {str(i): [{"caption": r}] for i, r in enumerate(refs)}
+    res = {str(i): [{"caption": h if h.strip() else "none"}] for i, h in enumerate(hyps)}
+    ptb = PTBTokenizer()
+    gts, res = ptb.tokenize(gts), ptb.tokenize(res)
+    out: Dict[str, float] = {}
+    bleu, _ = Bleu(4).compute_score(gts, res)
+    for i, b in enumerate(bleu, 1):
+        out[f"BLEU-{i}"] = float(b)
+    out["METEOR"] = float(Meteor().compute_score(gts, res)[0])
+    out["ROUGE-L"] = float(Rouge().compute_score(gts, res)[0])
+    out["CIDEr"] = float(Cider().compute_score(gts, res)[0])
+    return out
+
+
+GEN_KW = dict(
+    max_new_tokens=cfg.max_new_tokens,
+    min_new_tokens=cfg.min_new_tokens,
+    length_penalty=cfg.length_penalty,
+    no_repeat_ngram_size=cfg.no_repeat_ngram_size,
+    do_sample=False,
+    use_cache=True,
+    eos_token_id=tok.eos_token_id,
+    pad_token_id=tok.pad_token_id,
+)
+
+
+@torch.no_grad()
+def generate_split(model: MICModel, ds: CachedCaptionDataset,
+                   limit: Optional[int] = None, blind: bool = False,
+                   num_beams: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    model.eval()
+    sub = ds if limit is None else torch.utils.data.Subset(ds, list(range(min(limit, len(ds)))))
+    loader = DataLoader(sub, batch_size=cfg.gen_batch_size, shuffle=False,
+                        collate_fn=collate_gen, num_workers=cfg.num_workers)
+    beams = cfg.num_beams if num_beams is None else num_beams
+    refs, hyps = [], []
+    t0 = time.time()
+    for bi, b in enumerate(loader):
+        feats = b["feats"].to(DEVICE)
+        if blind:
+            feats = torch.zeros_like(feats)
+        with torch.autocast(DEVICE.type, dtype=AMP_DTYPE, enabled=DEVICE.type == "cuda"):
+            out = model.generate(
+                feats, b["input_ids"].to(DEVICE), b["attention_mask"].to(DEVICE),
+                num_beams=beams, early_stopping=beams > 1, **GEN_KW,
+            )
+        hyps.extend(tok.decode(o, skip_special_tokens=True).strip() for o in out)
+        refs.extend(b["captions"])
+        if bi % 25 == 0:
+            done = len(hyps)
+            print(f"    gen {done}  ({done / max(time.time() - t0, 1e-6):.1f} cap/s)",
+                  flush=True)
+    return refs, hyps
+
+
+def evaluate(model: MICModel, ds: CachedCaptionDataset, tag: str,
+             limit: Optional[int] = None, with_blind: bool = False) -> Dict[str, Any]:
+    refs, hyps = generate_split(model, ds, limit=limit)
+    m = coco_metrics(refs, hyps)
+    m["distinct-2"] = distinct_n(hyps, 2)
+    m["unique_caption_ratio"] = len(set(hyps)) / max(len(hyps), 1)
+    m["mean_len"] = float(np.mean([len(h.split()) for h in hyps]))
+    m["n"] = len(hyps)
+    print(f"  [{tag}] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                    for k, v in m.items()))
+    res: Dict[str, Any] = {"tag": tag, "sighted": m}
+    if with_blind:
+        _, bhyps = generate_split(model, ds, limit=limit, blind=True)
+        bm = coco_metrics(refs, bhyps)
+        bm["distinct-2"] = distinct_n(bhyps, 2)
+        identical = sum(int(a == b) for a, b in zip(hyps, bhyps)) / max(len(hyps), 1)
+        bm["identical_to_sighted"] = identical
+        print(f"  [{tag}/blind] " + "  ".join(f"{k}={v:.4f}" for k, v in bm.items()
+                                              if isinstance(v, float)))
+        print(f"  CIDEr sighted-blind delta = "
+              f"{m.get('CIDEr', float('nan')) - bm.get('CIDEr', float('nan')):+.4f}")
+        res["blind"] = bm
+    with open(os.path.join(cfg.out_dir, f"eval_{tag}.json"), "w", encoding="utf-8") as fh:
+        json.dump({"metrics": res,
+                   "samples": [{"ref": r, "hyp": h} for r, h in list(zip(refs, hyps))[:200]]},
+                  fh, indent=2)
+    return res
+
+
+# ---- metric smoke test: fail now, not after a full generation pass ----------
+_m = coco_metrics(["chest x-ray showing a right lower lobe nodule",
+                   "axial CT of the abdomen with a hepatic cyst"],
+                  ["chest x-ray with a nodule in the right lower lobe",
+                   "CT of the abdomen showing a liver cyst"])
+_need = {"BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"}
+assert _need <= set(_m), f"metrics missing: {_need - set(_m)} (check Java for METEOR/PTB)"
+print("metric smoke test:", {k: round(v, 4) for k, v in _m.items()})
+
+# ---- generation speed check: confirms the KV cache is active ----------------
+_t = time.time()
+generate_split(model, val_ds, limit=16, num_beams=cfg.num_beams)
+print(f"16 captions with beams={cfg.num_beams}: {time.time() - _t:.1f}s")
+
+
+
+
+
