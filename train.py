@@ -786,3 +786,174 @@ assert (_b["labels"][:, :PROMPT_LEN] == -100).all(), "prompt not masked out of l
 
  
 
+# %% [markdown]
+# ## Cell 10 — Projection MLP and the multimodal wrapper
+#
+# `proj_arch = "v4_layernorm_gate"` — unchanged from v4 so old checkpoints stay
+# loadable. The only difference is `gate_init` and whether the gate carries
+# gradient in Stage A (C6). The projection runs in fp32 and its output is cast to
+# the LM embedding dtype; keeping it out of autocast is what stopped the fc2
+# scale blow-up at `lr_proj=2e-3` in v3.
+
+# %%
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+
+
+class ProjectionMLP(nn.Module):
+    arch = PROJ_ARCH
+
+    def __init__(self, d_in: int, d_hidden: int, d_out: int,
+                 gate_init: float = 1.0, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(d_in, d_hidden)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(d_hidden, d_out)
+        self.norm = nn.LayerNorm(d_out)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc2(self.drop(self.act(self.fc1(x))))
+        return self.gate * self.norm(h)
+
+    @torch.no_grad()
+    def stats(self) -> Dict[str, float]:
+        return {"gate": float(self.gate.detach()),
+                "ln_gamma": float(self.norm.weight.detach().mean()),
+                "fc2_w_rms": float(self.fc2.weight.detach().pow(2).mean().sqrt())}
+
+
+class MICModel(nn.Module):
+    """Visual prefix + text. Loss on caption tokens only."""
+
+    def __init__(self, lm, proj: ProjectionMLP):
+        super().__init__()
+        self.lm = lm
+        self.proj = proj
+
+    @property
+    def embed(self):
+        return self.lm.get_input_embeddings()
+
+    def _build(self, feats: torch.Tensor, input_ids: torch.Tensor,
+               attention_mask: torch.Tensor,
+               labels: Optional[torch.Tensor] = None):
+        txt = self.embed(input_ids)
+        vis = self.proj(feats.to(torch.float32)).to(txt.dtype)
+        inp = torch.cat([vis, txt], dim=1)
+        vis_attn = torch.ones(vis.shape[:2], dtype=attention_mask.dtype,
+                              device=attention_mask.device)
+        attn = torch.cat([vis_attn, attention_mask], dim=1)
+        lab = None
+        if labels is not None:
+            pad = torch.full(vis.shape[:2], -100, dtype=labels.dtype,
+                             device=labels.device)
+            lab = torch.cat([pad, labels], dim=1)
+        return inp, attn, lab
+
+    def forward(self, feats, input_ids, attention_mask, labels,
+                label_smoothing: float = 0.0):
+        inp, attn, lab = self._build(feats, input_ids, attention_mask, labels)
+        out = self.lm(inputs_embeds=inp, attention_mask=attn)
+        logits = out.logits[:, :-1, :]
+        target = lab[:, 1:]
+
+        # Gather the supervised positions BEFORE upcasting. Only caption tokens
+        # carry a label — the 197-token visual span and the prompt are -100 —
+        # so this is ~10% of the sequence. Upcasting the full (B,T,51200) tensor
+        # to fp32 costs ~250 MB per micro-batch and is the difference between
+        # fitting and OOM on a 12 GB card. The value is identical: cross_entropy
+        # with reduction='mean' averages over non-ignored positions either way.
+        mask = target != -100
+        n_sup = int(mask.sum())
+        if n_sup == 0:
+            return logits.sum() * 0.0
+        loss = F.cross_entropy(
+            logits[mask].float(),
+            target[mask],
+            label_smoothing=label_smoothing,
+        )
+        return loss
+
+    @torch.no_grad()
+    def generate(self, feats, input_ids, attention_mask, **gen_kw):
+        inp, attn, _ = self._build(feats, input_ids, attention_mask, None)
+        out = self.lm.generate(inputs_embeds=inp, attention_mask=attn, **gen_kw)
+        return out
+
+
+def load_lm(cfg: Config):
+    # attn_implementation: "eager" materialises a (B, H, T, T) score tensor per
+    # layer and keeps it for backward. At B=4, H=32, T=247 over 32 layers that
+    # is several GB of retained activations — enough to push a 12 GiB card into
+    # sysmem fallback, where every access crosses PCIe and steps take minutes.
+    # "sdpa" uses a fused kernel that does not retain the score matrix.
+    #
+    # trust_remote_code is deliberately NOT set here: Phi-2 is native in
+    # transformers, and the remote modeling file is eager-only, so passing it
+    # can silently override the sdpa request. The tokenizer still uses it.
+    lm = AutoModelForCausalLM.from_pretrained(
+        cfg.lm_name,
+        torch_dtype=AMP_DTYPE if DEVICE.type == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+        cache_dir=cfg.hf_cache,
+    )
+    lm.config.pad_token_id = tok.pad_token_id
+    lm.config.use_cache = False
+    impl = getattr(lm.config, "_attn_implementation", "unknown")
+    print(f"LM loaded: dtype={next(lm.parameters()).dtype} attn={impl}")
+    assert impl == "sdpa", (
+        f"attention is {impl!r}, not sdpa. Eager attention retains the score "
+        "matrix per layer and will exhaust VRAM. Check the transformers version."
+    )
+    return lm
+
+
+def attach_lora(lm, cfg: Config):
+    lcfg = LoraConfig(
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        target_modules=list(cfg.lora_targets),
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    lm = get_peft_model(lm, lcfg)
+    lm.print_trainable_parameters()
+    return lm
+
+
+lm = load_lm(cfg)
+for p in lm.parameters():
+    p.requires_grad = False
+proj = ProjectionMLP(cfg.vit_dim, cfg.proj_hidden, cfg.lm_dim,
+                     gate_init=cfg.gate_init, dropout=cfg.proj_dropout).to(DEVICE)
+model = MICModel(lm.to(DEVICE), proj)
+
+# Trainable params (~11M) stay fp32 so AdamW updates are not quantised away at
+# lr=1e-3. The projection is already fp32 by construction; this covers LoRA in
+# Stage B, where get_peft_model inherits the base model's bf16.
+for n, p in model.named_parameters():
+    if p.requires_grad:
+        p.data = p.data.float()
+
+_n_proj = sum(p.numel() for p in proj.parameters())
+_n_lora = cfg.lora_r * 2 * cfg.lm_dim * 2 * lm.config.num_hidden_layers
+print(f"\nparameter budget (for the paper / architecture figure)")
+print(f"  ViT-B/16 (frozen)      {human(_n_vit)}")
+print(f"  Phi-2    (frozen)      {human(sum(p.numel() for p in lm.parameters()))}")
+print(f"  projection (trainable) {human(_n_proj)}")
+print(f"  LoRA r={cfg.lora_r} (trainable)  ~{human(_n_lora)}")
+print(f"  trainable total        ~{human(_n_proj + _n_lora)}")
+print(f"  proj stats at init     {proj.stats()}")
+if DEVICE.type == "cuda":
+    print(f"  VRAM after load        {torch.cuda.memory_allocated() / 2**30:.2f} GiB "
+          f"(expect ~5.3)")
+    torch.cuda.reset_peak_memory_stats()
+
