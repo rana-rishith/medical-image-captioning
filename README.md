@@ -111,3 +111,41 @@ v5 scores higher on all four. Treat this as indicative. DS@BioMed was scored on 
 
 ---
 
+## Quick start
+
+### Requirements
+
+- Python 3.10+
+- NVIDIA GPU with 12 GB VRAM or more (developed on an RTX 3060 12 GB)
+- A Java runtime for `pycocoevalcap` (PTBTokenizer and METEOR need it). On Windows, install Temurin and check that `java -version` works in the shell.
+- About 25 GB free disk for the feature cache (train, validation and test)
+
+```bash
+git clone https://github.com/rana-rishith/medical-image-captioning.git
+cd medical-image-captioning
+pip install -r requirements.txt
+```
+
+### Run
+
+`train.py` is written in cell format (`# %%` markers), so it opens as a notebook in VS Code or Jupytext and also runs as a plain script.
+
+Smoke test first. It uses 512 rows per split and one epoch per stage, and nothing it prints is reportable:
+
+```bash
+SMOKE=1 python train.py          # Linux / macOS
+set SMOKE=1 && python train.py   # Windows cmd
+```
+
+Then the full run:
+
+```bash
+python train.py
+```
+
+Paths default to `C:\mic` and `C:\hf_cache` on Windows and `/workspace/mic` and `/workspace/hf_cache` elsewhere; change `root` and `hf_cache` in `Config` to move them. On Windows the DataLoader uses `num_workers=0`.
+
+The script builds the feature cache on first run, runs both integrity gates, trains Stage A and Stage B, then writes `outputs_v5/final_results.json` with test metrics, the blind ablation and the grounding probe.
+
+---
+
