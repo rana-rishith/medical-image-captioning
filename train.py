@@ -1508,3 +1508,67 @@ best = run_stage(model, "B", cfg.stage_b_epochs, cfg, best_cider=-1.0)
 print(f"\nStage A best val CIDEr: {best_a:.4f}")
 print(f"Stage B best val CIDEr: {best:.4f}")
 
+# %% [markdown]
+# ## Cell 18 — Final evaluation on the full test split
+#
+# Checkpoint selected on validation CIDEr, reported on the held-out test split.
+# `eval_samples=None` means the full official ~9,927 images — not the 500-image
+# subset. Expect the headline numbers to move slightly relative to the 500-image
+# run; the full-split numbers are the ones to put in the paper.
+
+# %%
+load_ckpt(CKPT_BEST, model)
+test_res = evaluate(model, test_ds, "test_final", limit=cfg.eval_samples,
+                    with_blind=True)
+final_probe = grounding_probe(model, test_ds, cfg.diag_probe_samples)
+report_probe("test/final", final_probe)
+
+summary = {
+    "proj_arch": PROJ_ARCH,
+    "cache_sig": cfg.cache_sig(),
+    "gpu": torch.cuda.get_device_name(0) if DEVICE.type == "cuda" else "cpu",
+    "config": {k: v for k, v in asdict(cfg).items()
+               if isinstance(v, (int, float, str, bool, type(None)))},
+    "splits": {"train": len(train_ds), "val": len(val_ds), "test": len(test_ds)},
+    "cache_audit": audit,
+    "best_val_cider_stage_a": best_a,
+    "best_val_cider": best,
+    "test": test_res,
+    "grounding": final_probe,
+    "decoding": {"num_beams": cfg.num_beams, "max_new_tokens": cfg.max_new_tokens,
+                 "min_new_tokens": cfg.min_new_tokens,
+                 "no_repeat_ngram_size": cfg.no_repeat_ngram_size},
+}
+with open(os.path.join(cfg.out_dir, "final_results.json"), "w", encoding="utf-8") as fh:
+    json.dump(summary, fh, indent=2)
+print(json.dumps(summary["test"], indent=2))
+print(f"\nwrote {os.path.join(cfg.out_dir, 'final_results.json')}")
+
+# %% [markdown]
+# ## Cell 19 — Sample inference, sighted vs blind
+#
+# Ten rows where GEN and BLIND read the same is more legible evidence of
+# collapse than any scalar in the log.
+
+# %%
+n_show = 10
+items = [test_ds[i] for i in range(min(n_show, len(test_ds)))]
+gb = collate_gen(items)
+kw = dict(GEN_KW, num_beams=cfg.num_beams, early_stopping=cfg.num_beams > 1)
+model.eval()
+with torch.no_grad(), torch.autocast(DEVICE.type, dtype=AMP_DTYPE,
+                                     enabled=DEVICE.type == "cuda"):
+    s = model.generate(gb["feats"].to(DEVICE), gb["input_ids"].to(DEVICE),
+                       gb["attention_mask"].to(DEVICE), **kw)
+    z = model.generate(torch.zeros_like(gb["feats"]).to(DEVICE),
+                       gb["input_ids"].to(DEVICE),
+                       gb["attention_mask"].to(DEVICE), **kw)
+sighted = [tok.decode(o, skip_special_tokens=True).strip() for o in s]
+blind = [tok.decode(o, skip_special_tokens=True).strip() for o in z]
+same = 0
+for i, (g, bl, r) in enumerate(zip(sighted, blind, gb["captions"])):
+    same += int(g == bl)
+    print(f"\n[{i}] REF   : {r}")
+    print(f"    GEN   : {g}")
+    print(f"    BLIND : {bl}   {'<-- IDENTICAL' if g == bl else ''}")
+print(f"\nidentical sighted/blind: {same}/{len(sighted)}")
