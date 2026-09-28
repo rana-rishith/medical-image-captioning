@@ -100,3 +100,14 @@ Read the two rows as a change of protocol, not as a gain or a loss. Both the mod
 
 Both rows use `pycocoevalcap`. The figures in older versions of this README (BLEU-1 0.1652, METEOR 0.1586, CIDEr 0.1721) came from a from-scratch metric implementation and are withdrawn; they are not comparable with anything in this table.
 
+### Comparison with DS@BioMed (ImageCLEFmedical 2024)
+
+| System | BLEU-1 | METEOR | ROUGE | CIDEr | Hardware |
+|---|---|---|---|---|---|
+| DS@BioMed | 0.0121 | 0.0353 | 0.1031 | 0.0715 | — |
+| **This work (v5)** | **0.1043** | **0.0579** | **0.1667** | **0.1180** | 1× RTX 3060, 12 GB |
+
+v5 scores higher on all four. Treat this as indicative. DS@BioMed was scored on the ImageCLEFmedical 2024 test set (17,237 images) with that task's own tooling, not on the ROCOv2 test split, and the task reports ROUGE-1 where this work reports ROUGE-L. Stronger ImageCLEF 2024 systems, such as CS_Morgan, remain ahead of this work on BLEU, ROUGE and CIDEr. The contribution here is reaching this range on a single 12 GB card.
+
+---
+
