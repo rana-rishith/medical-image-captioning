@@ -87,3 +87,16 @@ The loss-level grounding probe on 256 test images agrees:
 
 Both are positive, so real images lower the loss, and the *right* image lowers it further than a wrong one. In v4 the zeros gap sat at −1.85.
 
+### 500-image validation vs full test split
+
+Earlier versions of this repo and the paper draft reported numbers on 500 randomly sampled validation images. Those are replaced by the full test split above.
+
+| Evaluation | Model | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | ROUGE-L | CIDEr |
+|---|---|---|---|---|---|---|---|---|
+| 500 validation images (earlier) | single-stage, 256-token window | 0.1362 | 0.0733 | 0.0361 | 0.0187 | 0.0636 | 0.1638 | 0.1045 |
+| **9,927 test images (current)** | **v5, two-stage** | **0.1043** | **0.0561** | **0.0288** | **0.0164** | **0.0579** | **0.1667** | **0.1180** |
+
+Read the two rows as a change of protocol, not as a gain or a loss. Both the model and the evaluation set differ between them, so no single cause explains the movement. The full test split is the one to cite: it is 20× larger, it is held out from checkpoint selection, and it matches the split other ROCOv2 papers report on.
+
+Both rows use `pycocoevalcap`. The figures in older versions of this README (BLEU-1 0.1652, METEOR 0.1586, CIDEr 0.1721) came from a from-scratch metric implementation and are withdrawn; they are not comparable with anything in this table.
+
