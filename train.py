@@ -1021,3 +1021,106 @@ def report_probe(tag: str, p: Dict[str, float]):
         print("       WARNING: mismatch_gap ~ 0 — captions do not depend on the image.")
     
 
+# %% [markdown]
+# ## Cell 12 — OVERFIT SANITY GATE (C5) — hard fail
+#
+# Train the projection (LM frozen) on 8 images for 300 steps, then generate on
+# those same 8. A working visual path memorises them: loss < 0.15 and the
+# generated caption matches the reference closely. If this fails, the break is
+# structural — embedding concat, label offset, dtype, feature path — and no
+# amount of schedule tuning on 79k images will fix it. Ten minutes here beats
+# twenty hours of a collapsing run.
+#
+# The projection is re-initialised afterwards, so this cell leaves no trace on
+# the real run.
+
+# %%
+def overfit_gate(cfg: Config, model: MICModel, ds: CachedCaptionDataset) -> bool:
+    import copy
+    saved = copy.deepcopy(model.proj.state_dict())
+    model.proj.gate.requires_grad_(True)
+    for p in model.proj.parameters():
+        p.requires_grad_(True)
+    opt = torch.optim.AdamW(model.proj.parameters(), lr=1e-3, weight_decay=0.0)
+
+    items = [ds[i] for i in range(cfg.overfit_images)]
+    batch = collate_train(items)
+    feats = batch["feats"].to(DEVICE)
+    ids = batch["input_ids"].to(DEVICE)
+    attn = batch["attention_mask"].to(DEVICE)
+    lab = batch["labels"].to(DEVICE)
+
+    print(f"overfitting {cfg.overfit_images} images for {cfg.overfit_steps} steps "
+          f"(no label smoothing; loss not comparable to Stage A)")
+    with torch.no_grad():
+        f = feats.float()
+        print(f"  feats: mean={f.mean():+.4f} std={f.std():.4f} "
+              f"min={f.min():+.3f} max={f.max():+.3f}")
+    model.train()
+    first = None
+    last = float("inf")
+    for step in range(1, cfg.overfit_steps + 1):
+        with torch.autocast(DEVICE.type, dtype=AMP_DTYPE, enabled=DEVICE.type == "cuda"):
+            loss = model(feats, ids, attn, lab, label_smoothing=0.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.proj.parameters(), cfg.max_grad_norm)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        last = loss.item()
+        if first is None:
+            first = last
+        if step % 50 == 0 or step == 1:
+            print(f"  step {step:>4}  loss {last:.4f}  {model.proj.stats()}")
+
+    model.eval()
+    gen_batch = collate_gen(items)
+    with torch.autocast(DEVICE.type, dtype=AMP_DTYPE, enabled=DEVICE.type == "cuda"):
+        out = model.generate(
+            gen_batch["feats"].to(DEVICE),
+            gen_batch["input_ids"].to(DEVICE),
+            gen_batch["attention_mask"].to(DEVICE),
+            max_new_tokens=cfg.max_new_tokens, num_beams=1, do_sample=False,
+            min_new_tokens=cfg.min_new_tokens, use_cache=True,
+            eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id,
+        )
+    gens = [tok.decode(o, skip_special_tokens=True).strip() for o in out]
+    print("\n  generated vs reference")
+    n_match = 0
+    for g, r in zip(gens, batch["captions"]):
+        gw, rw = set(g.lower().split()), set(r.lower().split())
+        ov = len(gw & rw) / max(len(rw), 1)
+        n_match += int(ov > 0.6)
+        print(f"    overlap {ov:.2f}\n      GEN: {g[:110]}\n      REF: {r[:110]}")
+
+    model.proj.load_state_dict(saved)
+    opt.zero_grad(set_to_none=True)
+    del opt
+    free_cuda()
+
+    loss_ok = (last <= cfg.overfit_loss_max) or (last <= cfg.overfit_drop_ratio * first)
+    cap_ok = n_match >= max(cfg.overfit_images // 2, 1)
+    passed = loss_ok and cap_ok
+    print(f"\n  loss {first:.4f} -> {last:.4f} "
+          f"(pass if <= {cfg.overfit_loss_max} or <= "
+          f"{cfg.overfit_drop_ratio * first:.4f})  loss_ok={loss_ok}")
+    print(f"  {n_match}/{cfg.overfit_images} captions recovered (>0.6 token overlap) "
+          f"cap_ok={cap_ok}")
+    print(f"  OVERFIT GATE: {'PASS' if passed else 'FAIL'}")
+    if not passed:
+        print("""
+  Do not proceed. In order, check:
+    1. model._build — is `vis` really prepended, and does `lab` get -100 padding
+       of exactly vis.shape[1] columns?
+    2. logits[:, :-1] vs labels[:, 1:] — an off-by-one here trains on the wrong
+       target and still produces a smoothly falling loss.
+    3. proj.gate — if it is drifting toward 0 even here, with 8 images and no
+       LoRA, the features themselves are the problem: re-run Cell 8.
+    4. feats dtype/scale — print feats.mean()/std(); ViT last_hidden_state
+       should be roughly zero-mean with std around 0.5-1.5.""")
+    return passed
+
+
+assert overfit_gate(cfg, model, train_ds), "overfit gate failed — stop here"
+log.write(event="overfit_gate", passed=True)
+        
+
