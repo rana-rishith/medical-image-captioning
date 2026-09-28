@@ -957,3 +957,67 @@ if DEVICE.type == "cuda":
           f"(expect ~5.3)")
     torch.cuda.reset_peak_memory_stats()
 
+# %% [markdown]
+# ## Cell 11 — Grounding diagnostics
+#
+# * `zeros_gap` = loss(zeroed features) − loss(real features). Positive means
+#   real images help. v4 sat at −1.85, i.e. images were actively hurting.
+# * `mismatch_gap` = loss(shuffled features) − loss(real features). This is the
+#   number to report: it isolates *which* image the caption came from, whereas
+#   `zeros_gap` can be inflated by any non-zero prefix.
+# * `distinct-2` on generated captions. A collapsed model emits one caption.
+#
+# All three run on a **fixed** probe subset so values are comparable across
+# epochs. Enable `cfg.aux_grounding_weight` only if `mismatch_gap` is still
+# under ~0.05 at the end of Stage A.
+
+# %%
+@torch.no_grad()
+def grounding_probe(model: MICModel, ds: CachedCaptionDataset,
+                    n: int = 256, bs: int = 4) -> Dict[str, float]:
+    model.eval()
+    idx = list(range(min(n, len(ds))))
+    loader = DataLoader(torch.utils.data.Subset(ds, idx), batch_size=bs,
+                        shuffle=False, collate_fn=collate_train, num_workers=0)
+    real = zero = mism = 0.0
+    nb = 0
+    for b in loader:
+        feats = b["feats"].to(DEVICE)
+        ids = b["input_ids"].to(DEVICE)
+        attn = b["attention_mask"].to(DEVICE)
+        lab = b["labels"].to(DEVICE)
+        with torch.autocast(DEVICE.type, dtype=AMP_DTYPE, enabled=DEVICE.type == "cuda"):
+            real += model(feats, ids, attn, lab).item()
+            zero += model(torch.zeros_like(feats), ids, attn, lab).item()
+            if feats.size(0) > 1:
+                perm = torch.roll(torch.arange(feats.size(0), device=DEVICE), 1)
+                mism += model(feats[perm], ids, attn, lab).item()
+            else:
+                mism += float("nan")
+        nb += 1
+    real, zero, mism = real / nb, zero / nb, mism / nb
+    return {"loss_real": real, "loss_zeros": zero, "loss_mismatch": mism,
+            "zeros_gap": zero - real, "mismatch_gap": mism - real}
+
+
+def distinct_n(caps: List[str], n: int = 2) -> float:
+    grams = set()
+    total = 0
+    for c in caps:
+        w = c.split()
+        for i in range(len(w) - n + 1):
+            grams.add(tuple(w[i:i + n]))
+            total += 1
+    return len(grams) / max(total, 1)
+
+
+def report_probe(tag: str, p: Dict[str, float]):
+    print(f"  [{tag}] real={p['loss_real']:.4f} zeros={p['loss_zeros']:.4f} "
+          f"mismatch={p['loss_mismatch']:.4f} | zeros_gap={p['zeros_gap']:+.4f} "
+          f"mismatch_gap={p['mismatch_gap']:+.4f}")
+    if tag.endswith("/pre"):
+        print("       (pre-training reference: mismatch_gap ~0 is expected here)")
+    elif p["mismatch_gap"] < 0.02:
+        print("       WARNING: mismatch_gap ~ 0 — captions do not depend on the image.")
+    
+
