@@ -1124,3 +1124,55 @@ assert overfit_gate(cfg, model, train_ds), "overfit gate failed — stop here"
 log.write(event="overfit_gate", passed=True)
         
 
+# %% [markdown]
+# ## Cell 13 — Checkpointing
+#
+# Every checkpoint carries `proj_arch`, `cache_sig` and the stage. `load_ckpt`
+# hard-fails on a tag mismatch rather than doing a silent `strict=False` partial
+# load — that is how a shortcut-baked state dict survives a "fix".
+
+# %%
+def save_ckpt(path: str, model: MICModel, stage: str, epoch: int,
+              best: float, extra: Optional[Dict] = None):
+    payload = {
+        "proj_arch": PROJ_ARCH,
+        "cache_sig": cfg.cache_sig(),
+        "stage": stage,
+        "epoch": epoch,
+        "best_cider": best,
+        "proj": {k: v.cpu() for k, v in model.proj.state_dict().items()},
+        "config": {k: v for k, v in asdict(cfg).items() if isinstance(v, (int, float, str, bool, type(None)))},
+    }
+    try:
+        payload["lora"] = {k: v.cpu() for k, v in get_peft_model_state_dict(model.lm).items()}
+    except Exception:
+        payload["lora"] = None
+    if extra:
+        payload["extra"] = extra
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def load_ckpt(path: str, model: MICModel, strict_sig: bool = True):
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if ck.get("proj_arch") != PROJ_ARCH:
+        raise RuntimeError(
+            f"checkpoint proj_arch={ck.get('proj_arch')} != {PROJ_ARCH}. "
+            f"Delete it:\n  rm {path}")
+    if strict_sig and ck.get("cache_sig") != cfg.cache_sig():
+        raise RuntimeError(
+            f"checkpoint was trained on cache_sig={ck.get('cache_sig')}, "
+            f"current is {cfg.cache_sig()}. Features changed; do not resume.")
+    model.proj.load_state_dict(ck["proj"])
+    if ck.get("lora"):
+        set_peft_model_state_dict(model.lm, ck["lora"])
+    print(f"resumed {path}: stage={ck['stage']} epoch={ck['epoch']} "
+          f"best_cider={ck['best_cider']:.4f}")
+    return ck
+
+
+CKPT_A = os.path.join(cfg.ckpt_dir, "stage_a.pt")
+CKPT_B = os.path.join(cfg.ckpt_dir, "stage_b.pt")
+CKPT_BEST = os.path.join(cfg.ckpt_dir, "best.pt")
+
