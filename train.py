@@ -542,3 +542,113 @@ for split in ("train", "validation", "test"):
     else:
         write_cache(cfg, hf_ds, recs, split)
 
+# %% [markdown]
+# ## Cell 8 — CACHE INTEGRITY GATE (C4) — hard fail
+#
+# This is the cell that decides whether any of the rest is worth running. Four
+# checks, in increasing strength:
+#
+# 1. **Header/shape/dtype** — read with `np.load(mmap_mode="r")`.
+# 2. **No dead rows** — a zero or constant row means a decode failure got cached.
+# 3. **Discriminability** — mean-pooled cosine between *different* rows must sit
+#    well below 1. If adjacent rows are near-identical, rows are spliced.
+# 4. **Round-trip** — re-encode K random images through the same `encode_images`
+#    and require cos > 0.995 against the cached row. This is the only check that
+#    can distinguish "features are fine" from "features are fine but attached to
+#    the wrong caption", and it is the one v4 never had.
+
+# %%
+def open_cache(cfg: Config, split: str):
+    fpath, mpath = cache_paths(cfg, split)
+    arr = np.load(fpath, mmap_mode="r")                 # C1
+    meta = json.load(open(mpath, encoding="utf-8"))
+    recs = meta["records"]
+    assert arr.shape[0] == len(recs), \
+        f"[{split}] rows {arr.shape[0]} != manifest {len(recs)}"
+    assert meta["cache_sig"] == cfg.cache_sig(), f"[{split}] cache_sig mismatch"
+    return arr, recs
+
+
+def audit_cache(cfg: Config, hf_ds, split: str) -> Dict[str, Any]:
+    arr, recs = open_cache(cfg, split)
+    n = arr.shape[0]
+    rng = np.random.default_rng(cfg.seed)
+    print(f"\n[{split}] rows={n} shape={arr.shape} dtype={arr.dtype}")
+
+    # ---- 2. dead rows -------------------------------------------------
+    probe = np.sort(rng.choice(n, size=min(128, n), replace=False))
+    rows = np.asarray(arr[probe], dtype=np.float32)
+    flat = rows.reshape(len(probe), -1)
+    per_row_std = flat.std(axis=1)
+    n_dead = int((per_row_std < 1e-4).sum())
+    print(f"  feature stats: mean={flat.mean():+.4f} std={flat.std():.4f}")
+    print(f"  row std: min={per_row_std.min():.4f} mean={per_row_std.mean():.4f} "
+          f"dead={n_dead}")
+    assert n_dead == 0, f"[{split}] {n_dead} constant/zero rows in cache"
+    assert np.isfinite(rows).all(), f"[{split}] non-finite values in cache"
+
+    # ---- 3. discriminability (CLS token — the most image-specific one) --
+    cls = rows[:, 0, :]
+    cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
+    sim = cls @ cls.T
+    off = sim[~np.eye(len(cls), dtype=bool)]
+    print(f"  CLS cos (different rows): mean={off.mean():.4f} "
+          f"p99={np.percentile(off, 99):.4f} max={off.max():.4f}")
+    if off.mean() > 0.97:
+        print("       NOTE: rows are highly similar. Expected to a degree for "
+              "greyscale radiology, but watch the round-trip check below.")
+    assert off.mean() < 0.995, \
+        f"[{split}] rows near-identical (mean CLS cos {off.mean():.4f}) — spliced or constant"
+
+    # ---- 4. round-trip -------------------------------------------------
+    k = min(cfg.verify_rows, n)
+    check = np.sort(rng.choice(n, size=k, replace=False))
+    split_ds = hf_ds[recs[0]["hf_split"]]
+    cos_all = []
+    for s in range(0, k, 8):
+        sub = check[s:s + 8]
+        imgs = split_ds.select([recs[int(i)]["hf_index"] for i in sub])["image"]
+        fresh = encode_images(imgs)                              # (b,197,768) f32
+        cached = np.asarray(arr[sub], dtype=np.float32)
+        a = fresh.reshape(len(sub), -1)
+        b = cached.reshape(len(sub), -1)
+        cos = (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-8)
+        cos_all.extend(cos.tolist())
+    cos_all = np.array(cos_all)
+    print(f"  round-trip cos over {k} rows: min={cos_all.min():.5f} "
+          f"mean={cos_all.mean():.5f}")
+    bad = int((cos_all < cfg.verify_cos_min).sum())
+    assert bad == 0, (
+        f"[{split}] {bad}/{k} rows fail round-trip (min cos {cos_all.min():.4f}).\n"
+        "  Cache row i is NOT the encoding of manifest record i. Do not train.\n"
+        "  Delete the cache directory and re-run Cell 7."
+    )
+
+    # ---- 5. off-by-one probe ------------------------------------------
+    # If rows were shifted by one, cos(fresh_i, cached_{i+1}) would beat
+    # cos(fresh_i, cached_i). Confirm the diagonal wins.
+    sub = check[:min(8, k)]
+    imgs = split_ds.select([recs[int(i)]["hf_index"] for i in sub])["image"]
+    fresh = encode_images(imgs).reshape(len(sub), -1)
+    shifted = np.asarray(arr[np.clip(sub + 1, 0, n - 1)], dtype=np.float32).reshape(len(sub), -1)
+    diag = np.asarray(arr[sub], dtype=np.float32).reshape(len(sub), -1)
+
+    def _cos(x, y):
+        return (x * y).sum(1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1) + 1e-8)
+
+    c_d, c_s = _cos(fresh, diag), _cos(fresh, shifted)
+    print(f"  aligned cos={c_d.mean():.5f}  shifted-by-1 cos={c_s.mean():.5f}  "
+          f"diagonal wins {int((c_d > c_s).sum())}/{len(sub)}")
+    assert bool((c_d > c_s).all()), (
+        f"[{split}] for at least one probe, row i+1 matches image i better than "
+        "row i does. The cache is shifted. Delete it and re-run Cell 7.")
+
+    print(f"  [{split}] PASS")
+    return {"split": split, "rows": int(n), "roundtrip_cos_min": float(cos_all.min()),
+            "pooled_cos_mean": float(off.mean())}
+
+
+audit = [audit_cache(cfg, hf_ds, s) for s in ("train", "validation", "test") if s in manifest]
+log.write(event="cache_audit", results=audit)
+print("\nCACHE INTEGRITY GATE: PASS")
+
