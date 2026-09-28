@@ -21,3 +21,26 @@ The point of the project is the budget. Most published ROCOv2 captioning systems
 
 ---
 
+## Architecture
+
+![v5 architecture](docs/architecture_v5.png)
+
+Training runs in two parts.
+
+**Stage 0, offline and one-time.** Every ROCOv2 image goes through a frozen ViT-Base/16 (`google/vit-base-patch16-224`, no pooler) once. The 197 × 768 patch embeddings land in an fp16 memory-mapped cache, 58,026 × 197 × 768 for the training split (about 17.6 GB on disk). From then on the encoder never runs during training: each step reads its features straight from disk through `np.load(mmap_mode="r")`. This one change removes 86M parameters of forward compute from every training step.
+
+**Stage 1, online.** Cached features pass through a trainable projection (Linear 768→2560, GELU, Linear 2560→2560, LayerNorm) and a learned scalar gate. The 197 visual tokens are prepended to the tokenized prompt and caption, then fed to Phi-2. Phi-2's base weights stay frozen; LoRA (r=8, α=16, dropout 0.05) sits on `q_proj` and `v_proj` in all 32 decoder blocks. Image and prompt positions carry label −100, so the cross-entropy covers caption tokens only.
+
+### What keeps it inside 12 GB
+
+| Measure | Effect |
+|---|---|
+| Offline ViT feature cache | encoder weights and activations never touch the training step |
+| Frozen Phi-2 + LoRA on q/v only | 2.62M adapter parameters instead of 2.78B |
+| SDPA attention (eager rejected at load time) | no retained (B, H, T, T) score matrix per layer |
+| Gradient checkpointing in both stages (`use_reentrant=False`) | activations recomputed instead of stored across 32 layers |
+| Loss computed on gathered caption positions before the fp32 upcast | avoids upcasting the full (B, T, 51,200) logit tensor, roughly 250 MB per micro-batch |
+| bf16 autocast where supported, fp16 + GradScaler otherwise | half-precision activations |
+| Micro-batch 4 × gradient accumulation 8 | effective batch 32 on a 12 GB card |
+| `expandable_segments` CUDA allocator | less fragmentation near the memory cap |
+
