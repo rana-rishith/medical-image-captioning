@@ -1467,3 +1467,44 @@ def run_stage(model: MICModel, stage: str, epochs: int, cfg: Config,
     return best_cider    
     
 
+# %% [markdown]
+# ## Cell 16 — Stage A: projection only
+#
+# Phi-2 fully frozen, no LoRA. Gradients have exactly one path to reduce loss:
+# through the visual projection. This is what removes the race between the
+# text-prior shortcut (fast) and visual grounding (slow).
+
+# %%
+best = run_stage(model, "A", cfg.stage_a_epochs, cfg)
+print(f"\nStage A best val CIDEr: {best:.4f}")
+pa = grounding_probe(model, val_ds, cfg.diag_probe_samples)
+report_probe("stageA/final", pa)
+if pa["mismatch_gap"] < 0.02:
+    print("""
+STOP AND READ. mismatch_gap is ~0 after Stage A with the LM frozen and no LoRA.
+That can not be a LoRA-shortcut problem, and the overfit gate already passed, so
+the projection can fit 8 images but not generalise across 79k. Likely causes, in
+order: lr_proj_a too high (try 3e-4), 197 visual tokens swamping a short caption
+(consider mean-pooling to 32 before the projection — that IS an architecture
+change, so decide deliberately), or the caption distribution being genuinely
+near-unimodal. Do not start Stage B expecting it to rescue this.""")
+
+# %% [markdown]
+# ## Cell 17 — Stage B: attach LoRA, fresh optimizer
+#
+# The projection weights carry forward; the optimizer state does not.
+
+# %%
+best_a = best
+lm_peft = attach_lora(model.lm, cfg)
+model.lm = lm_peft
+model.lm.config.use_cache = False
+
+# best_cider resets to -1: a Stage A "best" has no LoRA state, so loading it
+# into the Stage B model in Cell 18 would pair Stage A's projection with
+# whatever LoRA weights happened to be resident. Stage A's number is kept in
+# best_a for the paper's ablation table.
+best = run_stage(model, "B", cfg.stage_b_epochs, cfg, best_cider=-1.0)
+print(f"\nStage A best val CIDEr: {best_a:.4f}")
+print(f"Stage B best val CIDEr: {best:.4f}")
+
