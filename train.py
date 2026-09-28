@@ -652,3 +652,137 @@ audit = [audit_cache(cfg, hf_ds, s) for s in ("train", "validation", "test") if 
 log.write(event="cache_audit", results=audit)
 print("\nCACHE INTEGRITY GATE: PASS")
 
+# %% [markdown]
+# ## Cell 9 — Dataset, tokenizer, collator
+#
+# The dataset returns `(feature_row, caption)` taken from the **same** manifest
+# the cache was written with, so `__getitem__(i)` can not pair row *i* with
+# caption *j*. Labels are `-100` across the visual span and the prompt, so the
+# loss is only ever computed on caption tokens.
+
+# %%
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(cfg.lm_name, cache_dir=cfg.hf_cache,
+                                    trust_remote_code=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+tok.padding_side = "right"
+
+PROMPT_IDS = tok(cfg.prompt, add_special_tokens=False).input_ids
+PROMPT_LEN = len(PROMPT_IDS)
+
+# With label_smoothing=eps, the reported loss sits roughly eps*log(V) above the
+# true cross-entropy. Printing it once stops anyone re-deriving it from a log.
+from transformers import AutoTokenizer, AutoConfig
+
+tok = AutoTokenizer.from_pretrained(cfg.lm_name, cache_dir=cfg.hf_cache,
+                                    trust_remote_code=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+tok.padding_side = "right"
+
+PROMPT_IDS = tok(cfg.prompt, add_special_tokens=False).input_ids
+PROMPT_LEN = len(PROMPT_IDS)
+
+# Minimum reachable loss under label smoothing = entropy of the smoothed target.
+# C must be the LOGIT width (Phi-2: 51200), not len(tok) (50295).
+import math
+
+LOGIT_VOCAB = AutoConfig.from_pretrained(cfg.lm_name, cache_dir=cfg.hf_cache,
+                                         trust_remote_code=True).vocab_size
+
+
+def smoothing_floor(eps: float, C: int) -> float:
+    if eps <= 0:
+        return 0.0
+    p_true = 1 - eps + eps / C
+    p_other = eps / C
+    return -p_true * math.log(p_true) - (C - 1) * p_other * math.log(p_other)
+
+
+SMOOTH_FLOOR = smoothing_floor(cfg.label_smoothing, LOGIT_VOCAB)
+print(f"label smoothing {cfg.label_smoothing} over {LOGIT_VOCAB} logits "
+      f"-> minimum reachable train loss {SMOOTH_FLOOR:.3f}")
+print("  (probe losses use no smoothing; do not compare them to train loss)")
+print(f"tokenizer: vocab={len(tok)} pad={tok.pad_token_id} eos={tok.eos_token_id}")
+print(f"prompt ({PROMPT_LEN} tokens): {cfg.prompt!r}")
+
+
+class CachedCaptionDataset(Dataset):
+    def __init__(self, cfg: Config, split: str, limit: Optional[int] = None,
+                 indices: Optional[List[int]] = None):
+        self.cfg = cfg
+        self.split = split
+        self.path, _ = cache_paths(cfg, split)
+        _, self.records = open_cache(cfg, split)
+        self.arr = None                            # opened lazily per worker
+        self.index = list(range(len(self.records))) if indices is None else list(indices)
+        if limit is not None:
+            self.index = self.index[:limit]
+
+    def __len__(self):
+        return len(self.index)
+
+    def _ensure(self):
+        if self.arr is None:
+            self.arr = np.load(self.path, mmap_mode="r")   # C1, per-worker
+
+    def __getitem__(self, i: int):
+        self._ensure()
+        row = self.index[i]
+        feat = np.asarray(self.arr[row], dtype=np.float32)
+        rec = self.records[row]
+        return {"feat": torch.from_numpy(feat),
+                "caption": rec["caption"],
+                "row": row,
+                "hf_index": rec["hf_index"]}
+
+
+def collate_train(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    feats = torch.stack([b["feat"] for b in batch])
+    seqs, labels = [], []
+    for b in batch:
+        cap = tok(" " + b["caption"], add_special_tokens=False,
+                  truncation=True, max_length=cfg.max_caption_tokens).input_ids
+        cap = cap + [tok.eos_token_id]
+        ids = PROMPT_IDS + cap
+        lab = [-100] * PROMPT_LEN + cap
+        seqs.append(ids)
+        labels.append(lab)
+    T = max(len(s) for s in seqs)
+    input_ids = torch.full((len(seqs), T), tok.pad_token_id, dtype=torch.long)
+    label_ids = torch.full((len(seqs), T), -100, dtype=torch.long)
+    attn = torch.zeros((len(seqs), T), dtype=torch.long)
+    for i, (s, l) in enumerate(zip(seqs, labels)):
+        input_ids[i, :len(s)] = torch.tensor(s)
+        label_ids[i, :len(l)] = torch.tensor(l)
+        attn[i, :len(s)] = 1
+    return {"feats": feats, "input_ids": input_ids, "labels": label_ids,
+            "attention_mask": attn,
+            "captions": [b["caption"] for b in batch],
+            "rows": [b["row"] for b in batch]}
+
+
+def collate_gen(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    feats = torch.stack([b["feat"] for b in batch])
+    ids = torch.tensor([PROMPT_IDS] * len(batch), dtype=torch.long)
+    attn = torch.ones_like(ids)
+    return {"feats": feats, "input_ids": ids, "attention_mask": attn,
+            "captions": [b["caption"] for b in batch],
+            "rows": [b["row"] for b in batch]}
+
+
+train_ds = CachedCaptionDataset(cfg, "train")
+val_ds = CachedCaptionDataset(cfg, "validation")
+test_ds = CachedCaptionDataset(cfg, "test")
+print(f"datasets: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
+
+_b = collate_train([train_ds[i] for i in range(min(4, len(train_ds)))])
+print("sanity batch:", {k: tuple(v.shape) for k, v in _b.items()
+                        if isinstance(v, torch.Tensor)})
+assert (_b["labels"][:, :PROMPT_LEN] == -100).all(), "prompt not masked out of loss"
+
+
+ 
+
