@@ -390,3 +390,155 @@ def build_manifest(cfg: Config):
 hf_ds, manifest = build_manifest(cfg)
 log.write(event="manifest", counts={k: len(v) for k, v in manifest.items()})
 
+# %% [markdown]
+# ## Cell 6 — Load the ViT encoder (frozen)
+#
+# `add_pooling_layer=False`: the pooler is a randomly-initialised Linear(768,768)
+# whose output nothing reads — we take `last_hidden_state`. Removing it drops
+# 590,592 dead parameters from the reported count (86.39M -> 85.80M) and stops it
+# burning compute on every one of ~80k precompute forwards. It does **not**
+# change what gets cached.
+
+# %%
+from transformers import ViTModel, ViTImageProcessor
+
+vit_proc = ViTImageProcessor.from_pretrained(cfg.vit_name, cache_dir=cfg.hf_cache)
+vit = ViTModel.from_pretrained(
+    cfg.vit_name,
+    add_pooling_layer=False,
+    torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+    low_cpu_mem_usage=True,
+    cache_dir=cfg.hf_cache,
+).to(DEVICE).eval()
+for p in vit.parameters():
+    p.requires_grad = False
+
+_n_vit = sum(p.numel() for p in vit.parameters())
+print(f"ViT loaded: {human(_n_vit)} params, frozen, pooler={'present' if getattr(vit, 'pooler', None) else 'removed'}")
+assert getattr(vit, "pooler", None) is None, "pooler still attached"
+
+
+def _to_rgb(img) -> Image.Image:
+    if isinstance(img, dict) and "bytes" in img:
+        img = Image.open(io.BytesIO(img["bytes"]))
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(np.asarray(img))
+    return img.convert("RGB")
+
+
+@torch.no_grad()
+def encode_images(images: List[Any]) -> np.ndarray:
+    """-> (B, 197, 768) float32 numpy. Single code path for cache writes AND
+    the Cell 8 verification, so a preprocessing difference can not hide."""
+    pil = [_to_rgb(im) for im in images]
+    px = vit_proc(images=pil, return_tensors="pt")["pixel_values"]
+    px = px.to(DEVICE, dtype=vit.dtype)
+    out = vit(pixel_values=px).last_hidden_state
+    return out.float().cpu().numpy()
+
+# %% [markdown]
+# ## Cell 7 — Write the feature cache (C1, C2, C3)
+#
+# Writes to `<split>.npy.tmp` + `<split>.manifest.json.tmp`, then renames both
+# only after the last row lands. A killed job therefore leaves no half-file that
+# a later run could mistake for complete — which is the failure mode that
+# produced a 59,962-row `train.npy` for a 79k-row split.
+
+# %%
+def cache_paths(cfg: Config, split: str) -> Tuple[str, str]:
+    return (os.path.join(cfg.cache_dir, f"{split}.npy"),
+            os.path.join(cfg.cache_dir, f"{split}.manifest.json"))
+
+
+def cache_is_valid(cfg: Config, split: str, n_expected: int) -> bool:
+    fpath, mpath = cache_paths(cfg, split)
+    if not (os.path.exists(fpath) and os.path.exists(mpath)):
+        return False
+    try:
+        meta = json.load(open(mpath, encoding="utf-8"))
+    except Exception:
+        return False
+    if meta.get("cache_sig") != cfg.cache_sig():
+        print(f"  [{split}] cache_sig mismatch -> stale, will rebuild")
+        return False
+    if len(meta.get("records", [])) != n_expected:
+        print(f"  [{split}] manifest has {len(meta.get('records', []))} records,"
+              f" expected {n_expected} -> rebuild")
+        return False
+    arr = np.load(fpath, mmap_mode="r")          # C1: header-aware
+    if arr.shape != (n_expected, cfg.vit_tokens, cfg.vit_dim):
+        print(f"  [{split}] array shape {arr.shape} != "
+              f"{(n_expected, cfg.vit_tokens, cfg.vit_dim)} -> rebuild")
+        return False
+    if arr.dtype != cfg.np_feat_dtype:
+        print(f"  [{split}] dtype {arr.dtype} != {cfg.np_feat_dtype} -> rebuild")
+        return False
+    return True
+
+
+def write_cache(cfg: Config, hf_ds, records: List[Dict[str, Any]], split: str,
+                enc_batch: int = 32):
+    fpath, mpath = cache_paths(cfg, split)
+    ftmp, mtmp = fpath + ".tmp", mpath + ".tmp"
+    n = len(records)
+    shape = (n, cfg.vit_tokens, cfg.vit_dim)
+    nbytes = int(np.prod(shape)) * cfg.np_feat_dtype.itemsize
+    free = shutil.disk_usage(cfg.cache_dir).free
+    print(f"  [{split}] {n} rows -> {nbytes / 1e9:.2f} GB (free {free / 1e9:.1f} GB)")
+    if free < nbytes * 1.05:
+        raise RuntimeError(f"not enough free space for {split} cache")
+
+    # np.lib.format.open_memmap writes a proper .npy header, so the file is
+    # readable by np.load. Never np.memmap on these paths.
+    mm = np.lib.format.open_memmap(ftmp, mode="w+",
+                                   dtype=cfg.np_feat_dtype, shape=shape)
+    hf_split = records[0]["hf_split"]
+    assert all(r["hf_split"] == hf_split for r in records), \
+        f"[{split}] records span multiple HF splits"
+    split_ds = hf_ds[hf_split]
+    t0 = time.time()
+    try:
+        for s in range(0, n, enc_batch):
+            chunk = records[s:s + enc_batch]
+            idxs = [r["hf_index"] for r in chunk]
+            imgs = split_ds.select(idxs)["image"]
+            feats = encode_images(imgs)
+            mm[s:s + len(chunk)] = feats.astype(cfg.np_feat_dtype)
+            if s % (enc_batch * 50) == 0:
+                done = s + len(chunk)
+                rate = done / max(time.time() - t0, 1e-6)
+                eta = (n - done) / max(rate, 1e-6) / 60
+                print(f"    {done}/{n}  {rate:.1f} img/s  eta {eta:.1f} min", flush=True)
+        mm.flush()
+    finally:
+        del mm
+        free_cuda()
+
+    with open(mtmp, "w", encoding="utf-8") as fh:
+        json.dump({
+            "cache_sig": cfg.cache_sig(),
+            "split": split,
+            "shape": list(shape),
+            "dtype": cfg.feat_dtype,
+            "writer": "np.lib.format.open_memmap (npy header present)",
+            "reader": "np.load(mmap_mode='r')",
+            "records": records,
+        }, fh)
+
+    os.replace(ftmp, fpath)      # C2/C3: features and manifest land together
+    os.replace(mtmp, mpath)
+    print(f"  [{split}] done in {(time.time() - t0) / 60:.1f} min")
+
+
+for split in ("train", "validation", "test"):
+    if split not in manifest:
+        continue
+    recs = manifest[split]
+    if cfg.smoke:
+        recs = recs[: min(len(recs), 512)]
+        manifest[split] = recs
+    if cache_is_valid(cfg, split, len(recs)):
+        print(f"  [{split}] cache valid, reusing")
+    else:
+        write_cache(cfg, hf_ds, recs, split)
+
