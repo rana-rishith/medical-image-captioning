@@ -286,3 +286,107 @@ class JsonLog:
 
 log = JsonLog(os.path.join(cfg.out_dir, "train_log.jsonl"))
 
+# %% [markdown]
+# ## Cell 5 — Load ROCOv2 and build the manifest
+#
+# The manifest is the single source of truth for *which caption goes with which
+# cache row*. It is a plain list of `{split, hf_index, caption}` records, written
+# to disk next to the features in the same function that writes the features.
+# Nothing downstream ever re-derives an index from the HF dataset, so the two can
+# not drift. Caption-length filtering applies to **train only** — val and test
+# stay as the full official splits so reported metrics are comparable.
+
+# %%
+from datasets import load_dataset
+
+import re
+
+_WS = re.compile(r"\s+")
+
+
+def clean_caption(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    t = _WS.sub(" ", str(text)).strip()
+    return t
+
+
+CANON = ("train", "validation", "test")
+
+
+def resolve_splits(ds) -> Dict[str, Optional[str]]:
+    keys = list(ds.keys())
+
+    def pick(cands):
+        for c in cands:
+            if c in keys:
+                return c
+        return None
+
+    return {"train": pick(["train"]),
+            "validation": pick(["validation", "valid", "val", "dev"]),
+            "test": pick(["test"])}
+
+
+def _caption_key(cols: List[str]) -> str:
+    for cand in ("caption", "text", "Caption", "captions"):
+        if cand in cols:
+            return cand
+    raise RuntimeError(f"no caption column in {cols}")
+
+
+def build_manifest(cfg: Config):
+    ds = load_dataset(cfg.dataset_name, cache_dir=os.environ["HF_DATASETS_CACHE"])
+    print({k: len(v) for k, v in ds.items()})
+    smap = resolve_splits(ds)
+    print(f"  split map: {smap}")
+    if smap["train"] is None or smap["test"] is None:
+        raise RuntimeError(f"need train and test splits, got {list(ds.keys())}")
+
+    cap_key = _caption_key(ds[smap["train"]].column_names)
+    print(f"  caption column: {cap_key!r}")
+
+    def records_for(hf_split: str, canon: str, keep_idx: Optional[set] = None):
+        caps = ds[hf_split][cap_key]
+        apply_filter = (canon == "train")   # val/test stay as full official splits
+        recs, dropped = [], 0
+        for i, c in enumerate(caps):
+            if keep_idx is not None and i not in keep_idx:
+                continue
+            c = clean_caption(c)
+            n = len(c.split())
+            if n == 0:
+                dropped += 1
+                continue
+            if apply_filter and not (cfg.min_caption_words <= n <= cfg.max_caption_words):
+                dropped += 1
+                continue
+            recs.append({"split": canon, "hf_split": hf_split,
+                         "hf_index": i, "caption": c})
+        print(f"  {canon:<11} <- {hf_split:<11} kept {len(recs):>6} dropped {dropped:>6}"
+              f"  ({'length-filtered' if apply_filter else 'full official split'})")
+        return recs
+
+    manifest: Dict[str, List[Dict[str, Any]]] = {}
+    if smap["validation"] is not None:
+        manifest["train"] = records_for(smap["train"], "train")
+        manifest["validation"] = records_for(smap["validation"], "validation")
+    else:
+        # No official validation split: carve a deterministic 2% out of train.
+        # Records carry hf_split/hf_index, so the two canonical splits stay
+        # disjoint and the cache stays aligned by construction.
+        n_train = len(ds[smap["train"]])
+        rng = np.random.default_rng(cfg.seed)
+        perm = rng.permutation(n_train)
+        n_val = max(int(0.02 * n_train), 256)
+        val_idx, tr_idx = set(perm[:n_val].tolist()), set(perm[n_val:].tolist())
+        print(f"  no validation split found -> carving {n_val} rows out of train")
+        manifest["train"] = records_for(smap["train"], "train", keep_idx=tr_idx)
+        manifest["validation"] = records_for(smap["train"], "validation", keep_idx=val_idx)
+    manifest["test"] = records_for(smap["test"], "test")
+    return ds, manifest
+
+
+hf_ds, manifest = build_manifest(cfg)
+log.write(event="manifest", counts={k: len(v) for k, v in manifest.items()})
+
