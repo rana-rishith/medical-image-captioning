@@ -1302,3 +1302,168 @@ print(f"16 captions with beams={cfg.num_beams}: {time.time() - _t:.1f}s")
 
 
 
+# %% [markdown]
+# ## Cell 15 — The training loop
+#
+# One function for both stages; what differs is which parameters carry gradient
+# and which optimizer they are attached to. Stage B builds a **fresh** AdamW and
+# a fresh cosine schedule (C7) — carrying Stage A's second-moment estimates into
+# LoRA is what let the text prior win the race in v3.
+
+# %%
+def param_groups(model: MICModel, stage: str, cfg: Config):
+    if stage == "A":
+        for p in model.lm.parameters():
+            p.requires_grad_(False)
+        for n, p in model.proj.named_parameters():
+            p.requires_grad_(True if n != "gate" else cfg.gate_trainable_stage_a)
+        return [{"params": [p for p in model.proj.parameters() if p.requires_grad],
+                 "lr": cfg.lr_proj_a, "name": "proj"}]
+    for n, p in model.proj.named_parameters():
+        p.requires_grad_(True if n != "gate" else cfg.gate_trainable_stage_b)
+    lora = [p for n, p in model.lm.named_parameters() if "lora_" in n]
+    for p in lora:
+        p.requires_grad_(True)
+    return [
+        {"params": [p for p in model.proj.parameters() if p.requires_grad],
+         "lr": cfg.lr_proj_b, "name": "proj"},
+        {"params": lora, "lr": cfg.lr_lora, "name": "lora"},
+    ]
+
+
+CKPT_BEST_A = os.path.join(cfg.ckpt_dir, "best_stage_a.pt")
+
+
+def run_stage(model: MICModel, stage: str, epochs: int, cfg: Config,
+              best_cider: float = -1.0) -> float:
+    from transformers import get_cosine_schedule_with_warmup
+
+    groups = param_groups(model, stage, cfg)
+    names = [g["name"] for g in groups]
+    opt = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+    loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                        collate_fn=collate_train, num_workers=cfg.num_workers,
+                        pin_memory=DEVICE.type == "cuda", drop_last=True,
+                        persistent_workers=cfg.num_workers > 0)
+    steps_per_epoch = max(len(loader) // cfg.grad_accum, 1)
+    total = steps_per_epoch * epochs
+    sched = get_cosine_schedule_with_warmup(
+        opt, int(total * cfg.warmup_ratio), total)
+    scaler = torch.amp.GradScaler(DEVICE.type, enabled=USE_SCALER)
+
+    trainable = sum(p.numel() for g in groups for p in g["params"])
+    print(f"\n{'=' * 72}\nSTAGE {stage}: {epochs} epoch(s), {total} optimizer steps, "
+          f"groups={names}, trainable={human(trainable)}\n{'=' * 72}")
+    if stage == "A":
+        print(f"  gate trainable in Stage A: {model.proj.gate.requires_grad} "
+              f"(value {float(model.proj.gate):.4f})")
+
+    p0 = grounding_probe(model, val_ds, cfg.diag_probe_samples)
+    report_probe(f"stage{stage}/pre", p0)
+    log.write(event="stage_start", stage=stage, total_steps=total, **p0)
+
+    gstep = 0
+    for ep in range(1, epochs + 1):
+        model.train()
+        # Checkpointing applies to BOTH stages. A `stage == "B"` guard here was
+        # the memory bug: in Stage A the LM is frozen but the projected visual
+        # prefix carries grad, so without checkpointing every activation in all
+        # 32 layers is retained for backward. use_reentrant=False is required
+        # precisely because no *parameter* of the base model needs grad.
+        if (cfg.grad_checkpointing
+                and hasattr(model.lm, "gradient_checkpointing_enable")):
+            model.lm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+            model.lm.config.use_cache = False
+        run_loss, nb, t0 = 0.0, 0, time.time()
+        opt.zero_grad(set_to_none=True)
+        for i, b in enumerate(loader):
+            feats = b["feats"].to(DEVICE, non_blocking=True)
+            ids = b["input_ids"].to(DEVICE, non_blocking=True)
+            attn = b["attention_mask"].to(DEVICE, non_blocking=True)
+            lab = b["labels"].to(DEVICE, non_blocking=True)
+
+            with torch.autocast(DEVICE.type, dtype=AMP_DTYPE, enabled=DEVICE.type == "cuda"):
+                loss = model(feats, ids, attn, lab,
+                             label_smoothing=cfg.label_smoothing)
+                if (cfg.aux_grounding_weight > 0 and stage == "B"
+                        and i % cfg.aux_every == 0):
+                    with torch.no_grad():
+                        lz = model(torch.zeros_like(feats), ids, attn, lab,
+                                   label_smoothing=cfg.label_smoothing)
+                    loss = loss + cfg.aux_grounding_weight * F.relu(
+                        cfg.aux_grounding_margin + loss - lz)
+
+            if not torch.isfinite(loss):
+                print(f"  non-finite loss at micro-step {i}, skipping")
+                opt.zero_grad(set_to_none=True)
+                continue
+
+            scaler.scale(loss / cfg.grad_accum).backward()
+            run_loss += loss.item()
+            nb += 1
+
+            if (i + 1) % cfg.grad_accum == 0:
+                scaler.unscale_(opt)
+                gn = {g["name"]: float(torch.nn.utils.clip_grad_norm_(
+                    g["params"], cfg.max_grad_norm)) for g in groups}
+                scaler.step(opt)
+                scaler.update()
+                sched.step()
+                opt.zero_grad(set_to_none=True)
+                gstep += 1
+
+                # First logged step reports peak VRAM and observed step rate.
+                # Peak must stay under ~11 GiB on a 12 GiB card; above that the
+                # driver serves from system RAM and throughput collapses ~40x.
+                if gstep == 50 and DEVICE.type == "cuda":
+                    peak = torch.cuda.max_memory_allocated() / 2**30
+                    sps = (time.time() - t0) / gstep
+                    print(f"  [mem] peak {peak:.2f} GiB | {sps:.2f} s/opt-step "
+                          f"| epoch eta {sps * steps_per_epoch / 3600:.1f} h")
+                    if peak > 11.0:
+                        print("  [mem] WARNING: peak is close to the 12 GiB cap. "
+                              "Halve batch_size and double grad_accum — the "
+                              "effective batch of 32 is unchanged.")
+
+                if gstep % 50 == 0:
+                    print(f"  ep{ep} step {gstep}/{total} loss={run_loss / nb:.4f} "
+                          f"(floor {SMOOTH_FLOOR:.3f}) "
+                          f"lr={sched.get_last_lr()[0]:.2e} gn={gn} "
+                          f"{model.proj.stats()}", flush=True)
+                    log.write(event="step", stage=stage, epoch=ep, step=gstep,
+                              loss=run_loss / nb, grad_norms=gn,
+                              **model.proj.stats())
+
+        train_min = (time.time() - t0) / 60
+
+        # Turn checkpointing off before generation. It is inert under no_grad,
+        # but leaving it on keeps use_cache=False sticky, and beam search
+        # without a KV cache is roughly an order of magnitude slower.
+        if hasattr(model.lm, "gradient_checkpointing_disable"):
+            model.lm.gradient_checkpointing_disable()
+
+        p = grounding_probe(model, val_ds, cfg.diag_probe_samples)
+        report_probe(f"stage{stage}/ep{ep}", p)
+        ev = evaluate(model, val_ds, f"val_stage{stage}_ep{ep}",
+                      limit=cfg.val_probe_samples)
+        cider = ev["sighted"].get("CIDEr", -1.0)
+        print(f"  epoch {ep}: train {train_min:.1f} min, total {(time.time() - t0) / 60:.1f} min "
+              f"train_loss={run_loss / max(nb, 1):.4f} val_CIDEr(selection only)={cider:.4f}")
+        log.write(event="epoch", stage=stage, epoch=ep, train_minutes=train_min,
+                  train_loss=run_loss / max(nb, 1), val_cider=cider, **p)
+
+        save_ckpt(CKPT_A if stage == "A" else CKPT_B, model, stage, ep, best_cider)
+        if cider > best_cider:
+            best_cider = cider
+            save_ckpt(CKPT_BEST, model, stage, ep, best_cider, extra={"probe": p})
+            print(f"  new best (CIDEr {best_cider:.4f}) -> {CKPT_BEST}")
+            if stage == "A":
+                save_ckpt(CKPT_BEST_A, model, stage, ep, best_cider, extra={"probe": p})
+                print(f"  stage A best preserved -> {CKPT_BEST_A}")
+
+    del opt, sched, loader
+    free_cuda()
+    return best_cider    
+    
+
