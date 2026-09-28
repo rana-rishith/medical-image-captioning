@@ -149,3 +149,61 @@ The script builds the feature cache on first run, runs both integrity gates, tra
 
 ---
 
+## Repository layout
+
+```
+medical-image-captioning/
+├── train.py                          # v5 pipeline: cache, integrity gates, two-stage training, evaluation
+├── requirements.txt
+├── docs/
+│   └── architecture_v5.png           # architecture and data-flow figure
+├── legacy/
+│   ├── train_v3_single_stage.py      # earlier single-stage script (superseded)
+│   ├── smoke_test_v3.py              # smoke test for the single-stage script
+│   └── architecture_v3.png           # earlier figure (RTX 4090 setup)
+├── paper/
+│   └── README.md
+├── LICENSE
+└── README.md
+```
+
+Model weights, the feature cache and the dataset are not in the repo. ROCOv2 downloads from HuggingFace (`eltorio/ROCOv2-radiology`) on first run.
+
+---
+
+## Dataset
+
+ROCOv2 (`eltorio/ROCOv2-radiology`): 59,962 train, 9,904 validation and 9,927 test image–caption pairs from the biomedical literature. A caption-length filter (3–60 words) applies to the training split only, leaving 58,026 pairs. Validation keeps 9,903 images (one caption was empty after cleaning). Test is used in full.
+
+---
+
+## Acknowledgments
+
+- [ROCOv2](https://huggingface.co/datasets/eltorio/ROCOv2-radiology): Radiology Objects in COntext, version 2
+- [Microsoft Phi-2](https://huggingface.co/microsoft/phi-2)
+- [Google ViT-Base/16](https://huggingface.co/google/vit-base-patch16-224)
+- [LoRA (Hu et al., 2022)](https://arxiv.org/abs/2106.09685)
+- [LLaVA (Liu et al., 2023)](https://arxiv.org/abs/2304.08485), for the projection-prefix design
+- ImageCLEFmedical 2024 caption-prediction task, source of the DS@BioMed comparison
+
+---
+
+## Citation
+
+```bibtex
+@misc{musunuri2026medicalcaptioning,
+  author    = {Musunuri, Rana Rishith and Sharma, Nandani},
+  title     = {Resource-Efficient Medical Image Captioning with a Frozen ViT-Base Encoder and Phi-2 under LoRA Fine-Tuning},
+  year      = {2026},
+  publisher = {GitHub},
+  url       = {https://github.com/rana-rishith/medical-image-captioning}
+}
+```
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+**Disclaimer:** this is a research prototype and is **not** for clinical use. Generated captions must not inform diagnosis or treatment.
